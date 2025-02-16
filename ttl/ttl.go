@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type TTL struct {
@@ -23,9 +25,11 @@ type Item struct {
 }
 
 type shard struct {
-	id    uint64
-	data  map[string]*Item
-	mutex sync.RWMutex
+	id       uint64
+	uuid     uuid.UUID
+	data     map[string]*Item
+	termFunc context.CancelFunc
+	mutex    sync.RWMutex
 }
 
 type shards map[uint64]*shard
@@ -39,7 +43,7 @@ type shardLookupTable struct {
 func (ttl *TTL) Init() error {
 
 	newShard := shard{}
-	ttl.shardLookupTable = shardLookupTable{shards: shards{}}
+	ttl.shardLookupTable = shardLookupTable{shards: make(shards)}
 
 	ttl.newShard(&newShard)
 
@@ -47,8 +51,11 @@ func (ttl *TTL) Init() error {
 }
 
 func (ttl *TTL) Put(item *Item) (uint64, error) {
+
+	ttl.shardLookupTable.mutex.RLock()
 	shardId := ttl.shardLookupTable.currentShardId
 	currentShard := ttl.shardLookupTable.shards[shardId]
+	ttl.shardLookupTable.mutex.RUnlock()
 
 	if item.TTL.Nanoseconds() > 0 {
 		item.expirationTime = time.Now().Add(item.TTL)
@@ -56,13 +63,14 @@ func (ttl *TTL) Put(item *Item) (uint64, error) {
 		item.expirationTime = time.Now().Add(ttl.DefaultTTL)
 	}
 
+	currentShard.mutex.Lock()
 	if uint64(len(currentShard.data)) < ttl.ShardSize {
 
-		currentShard.mutex.Lock()
 		defer currentShard.mutex.Unlock()
 
 		currentShard.data[item.Key] = item
 	} else {
+		currentShard.mutex.Unlock()
 
 		newShard := shard{}
 		ttl.newShard(&newShard)
@@ -78,7 +86,17 @@ func (ttl *TTL) Put(item *Item) (uint64, error) {
 }
 
 func (ttl *TTL) Get(key string, shardId uint64) any {
-	data, exists := ttl.shardLookupTable.shards[shardId].data[key]
+	ttl.shardLookupTable.mutex.RLock()
+	shard, exists := ttl.shardLookupTable.shards[shardId]
+	ttl.shardLookupTable.mutex.RUnlock()
+
+	if !exists {
+		return nil
+	}
+
+	shard.mutex.RLock()
+	data, exists := shard.data[key]
+	shard.mutex.RUnlock()
 
 	if !exists {
 		return nil
@@ -95,7 +113,12 @@ func (ttl *TTL) Get(key string, shardId uint64) any {
 }
 
 func (ttl *TTL) Delete(key string, shardId uint64) {
-	shard := ttl.shardLookupTable.shards[shardId]
+	shard, exists := ttl.shardLookupTable.shards[shardId]
+
+	if !exists {
+		return
+	}
+
 	shard.mutex.Lock()
 	defer shard.mutex.Unlock()
 
@@ -108,13 +131,16 @@ func (ttl *TTL) newShard(shard *shard) {
 	defer ttl.shardLookupTable.mutex.Unlock()
 
 	newShardId := ttl.shardLookupTable.currentShardId + 1
+	ctx, cancel := context.WithCancel(context.Background())
+
 	shard.id = newShardId
 	shard.data = make(map[string]*Item)
+	shard.uuid = uuid.New()
+	shard.termFunc = cancel
 
 	ttl.shardLookupTable.shards[newShardId] = shard
 	ttl.shardLookupTable.currentShardId = newShardId
 
-	ctx := context.Background()
 	go shard.cleanup(ctx, ttl)
 }
 
@@ -129,6 +155,7 @@ func (shard *shard) cleanup(ctx context.Context, ttl *TTL) {
 		case <-ticker.C:
 			var expiredKeys []string
 
+			shard.mutex.Lock()
 			for k, v := range shard.data {
 				if v.expirationTime.Before(time.Now()) {
 					expiredKeys = append(expiredKeys, k)
@@ -136,17 +163,33 @@ func (shard *shard) cleanup(ctx context.Context, ttl *TTL) {
 			}
 
 			if len(expiredKeys) > 0 {
-				shard.mutex.Lock()
 				for _, k := range expiredKeys {
 					delete(shard.data, k)
 				}
-				if len(shard.data) == 0 {
-					delete(ttl.shardLookupTable.shards, shard.id) // idk if deleting the shard which is references in its own cleanup goroutine would work
-
-					return
-				}
-				shard.mutex.Unlock()
 			}
+
+			shardEmpty := len(shard.data) == 0
+
+			if shardEmpty {
+				shard.mutex.Unlock()
+				ttl.terminateShard(shard)
+				return
+			}
+			shard.mutex.Unlock()
 		}
+	}
+}
+
+func (ttl *TTL) terminateShard(shard *shard) {
+
+	ttl.shardLookupTable.mutex.Lock()
+	defer ttl.shardLookupTable.mutex.Unlock()
+
+	shard.mutex.Lock()
+	defer shard.mutex.Unlock()
+
+	if _, exists := ttl.shardLookupTable.shards[shard.id]; exists {
+		shard.termFunc()
+		delete(ttl.shardLookupTable.shards, shard.id)
 	}
 }
