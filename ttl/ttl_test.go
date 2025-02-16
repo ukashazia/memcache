@@ -1,12 +1,15 @@
 package ttl_test
 
 import (
+	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/ukashazia/memcache/ttl"
 )
 
@@ -94,4 +97,191 @@ func TestDelete(t *testing.T) {
 	cache.Delete("delete_me", shardID)
 
 	assert.Nil(t, cache.Get("delete_me", shardID))
+}
+
+func TestWorkload(t *testing.T) {
+	newTtl := ttl.TTL{
+		DefaultTTL:      10 * time.Second,
+		ShardSize:       500,
+		CleanupInterval: 100 * time.Millisecond,
+	}
+	newTtl.Init()
+
+	var wg sync.WaitGroup
+
+	numGoroutines := 5
+
+	numOps := 100
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(gID int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				key := fmt.Sprintf("key_%d_%d", gID, j)
+				item := ttl.Item{
+					Key:   key,
+					Value: fmt.Sprintf("value_%d_%d", gID, j),
+					TTL:   100 * time.Millisecond,
+				}
+				_, err := newTtl.Put(&item)
+				if err != nil {
+					return
+				}
+				time.Sleep(1 * time.Millisecond)
+			}
+		}(i)
+	}
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(gID int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				key := fmt.Sprintf("key_%d_%d", gID, j)
+				value := newTtl.Get(key, 1)
+				_ = value
+				time.Sleep(1 * time.Millisecond)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func TestConcurrentPutGet(t *testing.T) {
+	cache := &ttl.TTL{
+		DefaultTTL:      10 * time.Minute,
+		ShardSize:       100,
+		CleanupInterval: time.Hour,
+	}
+	err := cache.Init()
+	require.NoError(t, err)
+
+	const numGoroutines = 1000
+	var (
+		wg          sync.WaitGroup
+		keyCounter  uint64
+		keyShardMap sync.Map
+	)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key := generateKey(&keyCounter)
+			item := &ttl.Item{Key: key, Value: key}
+			shardID, err := cache.Put(item)
+			require.NoError(t, err)
+			keyShardMap.Store(key, shardID)
+		}()
+	}
+	wg.Wait()
+
+	for i := 1; i < numGoroutines; i++ {
+		key := generateTestKey(i)
+		shardID, ok := keyShardMap.Load(key)
+		require.True(t, ok, "Key %s not found in shard map", key)
+
+		value := cache.Get(key, shardID.(uint64))
+		require.Equal(t, key, value, "Key %s mismatch", key)
+	}
+}
+
+func TestConcurrentPutDeleteGet(t *testing.T) {
+	cache := &ttl.TTL{
+		DefaultTTL:      time.Minute,
+		ShardSize:       50,
+		CleanupInterval: time.Hour,
+	}
+	err := cache.Init()
+	require.NoError(t, err)
+
+	const (
+		numGoroutines = 500
+		keyRange      = 100
+	)
+	var (
+		wg          sync.WaitGroup
+		keyCounter  uint64
+		keyShardMap sync.Map
+	)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key := generateTestKey(i % keyRange)
+
+			switch atomic.AddUint64(&keyCounter, 1) % 3 {
+			case 0:
+				item := &ttl.Item{Key: key, Value: key}
+				shardID, err := cache.Put(item)
+				require.NoError(t, err)
+				keyShardMap.Store(key, shardID)
+			case 1:
+				if shardID, ok := keyShardMap.Load(key); ok {
+					cache.Delete(key, shardID.(uint64))
+				}
+			case 2:
+				if shardID, ok := keyShardMap.Load(key); ok {
+					value := cache.Get(key, shardID.(uint64))
+					if value != nil {
+						require.Equal(t, key, value)
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestShardCleanupUnderLoad(t *testing.T) {
+	cache := &ttl.TTL{
+		DefaultTTL:      time.Second,
+		ShardSize:       100,
+		CleanupInterval: 100 * time.Millisecond,
+	}
+	err := cache.Init()
+	require.NoError(t, err)
+
+	const numGoroutines = 1000
+	var (
+		wg          sync.WaitGroup
+		keyCounter  uint64
+		keyShardMap sync.Map
+	)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key := generateKey(&keyCounter)
+			item := &ttl.Item{
+				Key:   key,
+				Value: key,
+				TTL:   time.Second,
+			}
+			shardID, err := cache.Put(item)
+			require.NoError(t, err)
+			keyShardMap.Store(key, shardID)
+		}()
+	}
+	wg.Wait()
+
+	time.Sleep(2*time.Second + 100*time.Millisecond)
+
+	keyShardMap.Range(func(key, shardID any) bool {
+		value := cache.Get(key.(string), shardID.(uint64))
+		require.Nil(t, value, "Key %s should be expired", key)
+		return true
+	})
+}
+
+func generateKey(counter *uint64) string {
+	return fmt.Sprintf("key-%d", atomic.AddUint64(counter, 1))
+}
+
+func generateTestKey(i int) string {
+	return fmt.Sprintf("key-%d", i)
 }
