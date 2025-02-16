@@ -4,8 +4,6 @@ import (
 	"context"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // TTL represents a time-based cache system with sharding and dynamic eviction.
