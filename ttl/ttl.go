@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // TTL represents a time-based cache system with sharding and dynamic eviction.
@@ -46,12 +48,14 @@ type shardLookupTable struct {
 func (ttl *TTL) Init() error {
 	newShard := shard{}
 	ttl.shardLookupTable = shardLookupTable{shards: make(shards)}
+
 	ttl.newShard(&newShard)
 	return nil
 }
 
 // Put inserts an item into the cache and returns the shard ID it was stored in.
 func (ttl *TTL) Put(item *Item) (uint64, error) {
+
 	ttl.shardLookupTable.mutex.RLock()
 	shardId := ttl.shardLookupTable.currentShardId
 	currentShard := ttl.shardLookupTable.shards[shardId]
@@ -64,7 +68,9 @@ func (ttl *TTL) Put(item *Item) (uint64, error) {
 	}
 
 	currentShard.mutex.Lock()
+
 	if uint64(len(currentShard.data)) < ttl.ShardSize && !currentShard.isTerminated && currentShard != nil {
+
 		currentShard.data[item.Key] = item
 		currentShard.mutex.Unlock()
 	} else {
@@ -162,6 +168,7 @@ func (shard *shard) cleanup(ctx context.Context, ttl *TTL) {
 			}
 
 			if len(shard.data) == 0 {
+
 				shard.mutex.Unlock()
 				ttl.terminateShard(shard)
 				return
@@ -173,6 +180,7 @@ func (shard *shard) cleanup(ctx context.Context, ttl *TTL) {
 
 // terminateShard removes an empty shard from the lookup table.
 func (ttl *TTL) terminateShard(shard *shard) {
+
 	ttl.shardLookupTable.mutex.Lock()
 	defer ttl.shardLookupTable.mutex.Unlock()
 
