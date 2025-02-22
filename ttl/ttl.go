@@ -152,17 +152,11 @@ func (shard *shard) cleanup(ctx context.Context, ttl *TTL) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var expiredKeys []string
-
 			shard.mutex.Lock()
 			for k, v := range shard.data {
 				if v.expirationTime.Before(time.Now()) {
-					expiredKeys = append(expiredKeys, k)
+					delete(shard.data, k)
 				}
-			}
-
-			for _, k := range expiredKeys {
-				delete(shard.data, k)
 			}
 
 			if len(shard.data) == 0 {
